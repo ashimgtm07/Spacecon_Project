@@ -1,0 +1,279 @@
+var landsat5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+                  .filterDate('2000-05-01', '2000-12-30')
+                  .select('SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL')
+                  .filterMetadata('CLOUD_COVER', 'less_than', 10)
+                  .filterBounds(nepal)
+        //     .map(function(image) {
+        // var qa = image.select("QA_PIXEL");
+        // var mask = qa.bitwiseAnd(1 << 10).eq(0);
+        // return image.updateMask(mask).divide(10000)});
+
+function computeLandsatIndices(image) {
+    var ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI').clip(nepal);
+    var ndbi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDBI').clip(nepal);
+    var evi = image.expression(
+        '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+        'NIR': image.select('SR_B4'),
+        'RED': image.select('SR_B3'),
+        'BLUE': image.select('SR_B1')
+    }).rename('EVI').clip(nepal);
+    
+    return image.addBands(ndvi).addBands(ndbi).addBands(evi);
+}
+
+var landsatIndices = landsat5.map(computeLandsatIndices);
+
+var ndviVis = {min: 0, max: 1, palette: ['blue', 'white', 'green']};
+var ndbiVis = {min: -1, max: 1, palette: ['white', 'yellow', 'red']};
+var eviVis = {min: 0, max: 1, palette: ['blue', 'white', 'green']};
+
+var landsatMean = landsatIndices.mean();
+
+Map.centerObject(nepal, 9);
+// Map.addLayer(landsatMean.select('NDVI'), ndviVis, 'NDVI - Landsat 2000');
+// Map.addLayer(landsatMean.select('NDBI'), ndbiVis, 'NDBI - Landsat 2000');
+// Map.addLayer(landsatMean.select('EVI'), eviVis, 'EVI - Landsat 2000');
+
+var dem = ee.Image("USGS/SRTMGL1_003").select('elevation').rename('Elevation').clip(nepal);
+
+var era5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR") 
+                .filterDate('2000-05-01', '2000-12-31')
+                .select(['temperature_2m', 'total_precipitation_sum'])
+                .mean()
+                .rename(['Temperature', 'Precipitation']).clip(nepal);
+
+var landCover = ee.ImageCollection("MODIS/061/MCD12Q1")
+                  .filterDate('2001-01-01', '2001-12-31')
+                  .median()
+                  .select('LC_Type1')
+                  .rename('Land_Cover').clip(nepal);
+
+var modisLST = ee.ImageCollection("MODIS/061/MOD11A1")
+                  .filterDate('2000-05-01', '2000-12-31')
+                  .select('LST_Day_1km')
+                  .mean()
+                  .multiply(0.02)
+                  .subtract(273.15)
+                  .rename('LST').clip(nepal);
+
+var population = ee.ImageCollection("CIESIN/GPWv411/GPW_UNWPP-Adjusted_Population_Density")
+                    .filterDate('2000-01-01', '2000-12-31')
+                    .select('unwpp-adjusted_population_density')
+                    .first()
+                    .rename('Population_Density').clip(nepal);
+
+print('Landsat Mean:', landsatMean);
+print('MODIS LST:', modisLST);
+print('Population Density:', population);
+print('Elevation:', dem);
+print('ERA5 Climate:', era5);
+print('MODIS Land Cover:', landCover);
+
+var targetProjection = ee.Projection('EPSG:4326').atScale(30);
+var targetScale = 30; 
+
+
+var mergedImage = ee.Image.cat([
+  landsatMean, modisLST, population, dem, era5, landCover
+]);
+
+
+function normalizeBand(band, bandName) {
+  band = band
+    .reproject({ crs: targetProjection })
+    .resample('bilinear'); 
+
+  var stats = band.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: nepal,
+    scale: targetScale,
+    bestEffort: true
+  });
+
+  var min = ee.Number(stats.get(bandName + '_min', 0));
+  var max = ee.Number(stats.get(bandName + '_max', 1));
+
+
+  min = ee.Algorithms.If(min, min, 0);
+  max = ee.Algorithms.If(max, max, 1);
+
+  return band
+    .subtract(ee.Number(min))
+    .divide(ee.Number(max).subtract(ee.Number(min)))
+    .rename(bandName);
+}
+
+function normalizeResampleImage(image) {
+  var bandNames = image.bandNames();
+
+  var normalizedBands = bandNames.map(function(bandName) {
+    bandName = ee.String(bandName);
+    var band = image.select([bandName]);
+    return normalizeBand(band, bandName);
+  });
+
+  return ee.ImageCollection(normalizedBands).toBands()
+           .setDefaultProjection(targetProjection);
+}
+
+
+var processedImage = normalizeResampleImage(mergedImage);
+print("Processed Image", processedImage);
+
+var elevationVis = {min: 0, max: 8848, palette: ['blue', 'green', 'yellow', 'red']};
+var tempVis = {min: 250, max: 290, palette: ['blue', 'purple', 'red']};
+var precipVis = {min: 0, max: 0.009, palette: ['white', 'blue']};
+var landCoverVis = {min: 0, max: 17, palette: [
+  '05450a', '086a10', '54a708', '78d203', '009900', 'c6b044', 'dcd159', 
+  'dade48', 'fbff13', 'b6ff05', '27ff87', 'c24f44', 'a5a5a5', 'ff6d4c', 
+  '69fff8', 'f9ffa4', '1c0dff']};
+var lstVis = {min: -20, max: 30, palette: ['blue', 'cyan', 'yellow', 'red']};
+var popVis = {min: 0, max: 2000, palette: ['white', 'blue', 'red']};
+
+
+Map.centerObject(nepal, 9);
+
+// Map.addLayer(dataset.select('Elevation'), elevationVis, 'Elevation');
+// Map.addLayer(dataset.select('Temperature'), tempVis, 'Temperature (ERA5)');
+// Map.addLayer(dataset.select('Precipitation'), precipVis, 'Precipitation (ERA5)');
+// Map.addLayer(dataset.select('Land_Cover'), landCoverVis, 'Land Cover (MODIS)');
+// Map.addLayer(dataset.select('LST'), lstVis, 'Land Surface Temperature (MODIS)');
+// Map.addLayer(dataset.select('Population_Density'), popVis, 'Population Density');
+
+var training =processedImage.sample({
+    region: nepal,
+    scale: 30,
+    numPixels: 1000,
+    geometries: true
+}).randomColumn();
+print(training);
+Map.addLayer(training,{}, "training dataset", false);
+var trainSet = training.filter(ee.Filter.lte('random', 0.8));
+var testSet = training.filter(ee.Filter.gt('random', 0.8));
+print('TrainSize', trainSet.size(), 'TestSize', testSet.size());
+Export.table.toDrive({
+    collection: testSet,
+    description: "testing_data",
+    fileFormat: "CSV"
+});
+var classifier = ee.Classifier.smileRandomForest(50).train({
+    features: trainSet,
+    classProperty: '10_LST',
+    inputProperties: ['7_NDVI', '8_NDBI', '9_EVI', '12_Elevation', '13_Temperature', '14_Precipitation', '15_Land_Cover', '11_Population_Density']
+}).setOutputMode('REGRESSION');
+var classified = processedImage.classify(classifier).rename('Predicted_LST');
+print('Predicted', classified);
+Map.addLayer(classified.select('Predicted_LST'), {
+  min: -20, max: 30, palette: ['blue', 'cyan', 'yellow', 'red']
+}, 'Predicted LST');
+var classifiedValidation = testSet.classify(classifier);
+Export.image.toDrive({
+  image: classified,
+  description: 'LST_Export_2000',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'LST_2000',
+  region: nepal,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13                         
+});
+
+var validation = classifiedValidation.map(function(feature) {
+  var predicted = feature.get('classification');
+  return feature.set('Predicted LST', predicted).select(['.*'], null, false);
+});
+print('Validation Data', validation);
+var actualLST = validation.select('10_LST');
+var predictedLST = validation.select('Predicted LST');
+var result = validation.map(function (feature) {
+  return feature.set({
+    'predicted_LST': feature.get('Predicted LST'),
+    'actual_LST': feature.get('10_LST')
+  });
+});
+print(validation.aggregate_stats('10_LST')); 
+print(validation.aggregate_stats('Predicted LST'));
+var chart = ui.Chart.feature.byFeature(validation, '10_LST', [ 'Predicted LST'])
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Comparison of Actual and Predicted LST',
+    hAxis: {title: 'Actual LST (°C)', viewWindow: {min: -20, max: 30}}, 
+    vAxis: {title: 'Predicted LST (°C)', viewWindow: {min: -20, max: 30}},
+    pointSize: 3,
+    trendlines: {0: {type: 'linear', color: 'red', lineWidth: 2, opacity: 0.3}},
+    series: { 0: {color: 'blue', pointSize: 3} }
+  });
+
+print(chart);
+
+var validationWithErrors = validation.map(function(feature) {
+  var actual = ee.Number(feature.get('10_LST'));
+  var predicted = ee.Number(feature.get('Predicted LST'));
+  var error = predicted.subtract(actual);
+  var absError = error.abs();
+  var squaredError = error.pow(2);
+  
+  return feature.set({
+    'error': error,
+    'absError': absError,
+    'squaredError': squaredError
+  });
+});
+
+// MAE: Mean Absolute Error
+var mae = validationWithErrors.reduceColumns({
+  reducer: ee.Reducer.mean(),
+  selectors: ['absError']
+}).get('mean');
+
+// MSE: Mean Squared Error
+var mse = validationWithErrors.reduceColumns({
+  reducer: ee.Reducer.mean(),
+  selectors: ['squaredError']
+}).get('mean');
+
+// RMSE: Root Mean Squared Error
+var rmse = ee.Number(mse).sqrt();
+
+// Bias (Mean Error)
+var bias = validationWithErrors.reduceColumns({
+  reducer: ee.Reducer.mean(),
+  selectors: ['error']
+}).get('mean');
+
+// R² (Coefficient of Determination)
+var actualList = validationWithErrors.aggregate_array('10_LST');
+var predictedList = validationWithErrors.aggregate_array('Predicted LST');
+
+// Compute R² using Pearson's R squared
+var meanActual = ee.Number(actualList.reduce(ee.Reducer.mean()));
+var totalVariance = ee.Number(actualList.map(function(val) {
+  val = ee.Number(val);
+  return val.subtract(meanActual).pow(2);
+}).reduce(ee.Reducer.sum()));
+
+var residualVariance = ee.Number(validationWithErrors.aggregate_array('error').map(function(val) {
+  val = ee.Number(val);
+  return val.pow(2);
+}).reduce(ee.Reducer.sum()));
+
+var rSquared = ee.Number(1).subtract(residualVariance.divide(totalVariance));
+
+// Actual LST Range for % Accuracy
+var lstRange = validationWithErrors.reduceColumns({
+  reducer: ee.Reducer.minMax(),
+  selectors: ['10_LST']
+});
+var lstMin = ee.Number(lstRange.get('min'));
+var lstMax = ee.Number(lstRange.get('max'));
+var lstRangeValue = lstMax.subtract(lstMin);
+
+var percentageAccuracy = ee.Number(1).subtract(ee.Number(mae).divide(lstRangeValue)).multiply(100);
+
+print('MAE:', mae);
+print('MSE:', mse);
+print('RMSE:', rmse);
+print('Bias:', bias);
+print('R² (Coefficient of Determination):', rSquared);
+print('Actual LST Range:', lstRangeValue);
+print('Percentage Accuracy (%):', percentageAccuracy);
